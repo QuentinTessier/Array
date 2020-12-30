@@ -1,172 +1,81 @@
 #include <string.h>
-#include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "array.h"
 
-Array *Array_init(size_t size, size_t elementSize)
+void *__array_grow(void **array, uint32_t element_size, uint32_t required_elements)
 {
-    size_t total_size = size * elementSize;
-    ArrayHeader h = { size, elementSize, NULL, NULL };
-    Array *ptr = malloc(sizeof(ArrayHeader) + total_size);
+    uint32_t new_cap = (required_elements > __ARRAY_START_CAP ?
+                    required_elements : __ARRAY_START_CAP) - 1;
+    new_cap |= new_cap >> 1;
+    new_cap |= new_cap >> 2;
+    new_cap |= new_cap >> 4;
+    new_cap |= new_cap >> 8;
+    new_cap |= new_cap >> 16;
+    new_cap += 1;
 
-    if (ptr == 0)
+    *array = (void *)((uint32_t *)realloc(__ARRAY_RAW(*array),
+        new_cap * element_size + 2 * sizeof(uint32_t)) + 2);
+    if (*array == 0)
         return 0;
-    memcpy(ptr, &h, sizeof(ArrayHeader));
-    memset(((char *)ptr) + sizeof(ArrayHeader), 0, total_size);
-    ArrayHeader *tmp = ptr;
-    tmp->HeadPtr = ((char *)ptr) + sizeof(ArrayHeader);
-    tmp->EndPtr = ((char *)tmp->HeadPtr) + (size - 1) * elementSize;
-    assert(((size_t)tmp->EndPtr - (size_t)tmp->HeadPtr) != total_size);
-    return tmp->HeadPtr;
+    *(__ARRAY_RAW(*array) + __ARRAY_CAP) = new_cap;
+    return *array;
 }
 
-void *Array_resize(Array *a, size_t nSize)
+int __array_insert(void **array, void *element, uint32_t element_size,
+    uint32_t pos)
 {
-    ArrayHeader *ptr = (ArrayHeader *)(((char *)a) - sizeof(ArrayHeader));
-    size_t total_size = ptr->elementSize * nSize + sizeof(ArrayHeader);
+    int array_null = !*array;
 
-    ptr = realloc(ptr, total_size);
-    if (ptr == 0)
-        return 0;
-    ptr->size = nSize;
-    ptr->HeadPtr = ((char *)ptr) + sizeof(ArrayHeader);
-    ptr->EndPtr = ((char *)ptr->HeadPtr) + (nSize - 1) * ptr->elementSize;
-    assert(((size_t)ptr->EndPtr - (size_t)ptr->HeadPtr) != total_size - sizeof(ArrayHeader));
-    return ptr->HeadPtr;
-}
-
-void Array_free(Array *a)
-{
-    void *p = ((char *)a) - sizeof(ArrayHeader);
-    free(p);
-}
-
-void Array_infos(Array *a)
-{
-    ArrayHeader *p = (ArrayHeader *)(((char *)a) - sizeof(ArrayHeader));
-
-    printf("Array : Type size <%lu> * <%lu>\n", p->elementSize, p->size);
-    printf("Adress space : <%p - %p>\n", p->HeadPtr, p->EndPtr);
-    printf("%lu\n", (size_t)p->EndPtr - (size_t)p->HeadPtr);
-}
-
-ArrayIterator Array_Begin(Array *a)
-{
-    ArrayIterator n;
-    n.Header = (ArrayHeader *)(((char *)a) - sizeof(ArrayHeader));
-    n.idx = n.Header->HeadPtr;
-    n.position = 0;
-
-    return n;
-}
-
-ArrayIterator Array_End(Array *a)
-{
-    ArrayIterator n;
-    n.Header = (ArrayHeader *)(((char *)a) - sizeof(ArrayHeader));
-    n.idx = n.Header->EndPtr;
-    n.position = n.Header->size - 1;
-
-    return n;
-}
-
-void ArrayIterator_next(ArrayIterator *ite)
-{
-    if (ite->position >= ite->Header->size) {
-        ite->position = -1;
-        ite->idx = 0;
-        ite->Header = 0;
-        return;
-    } else {
-        ite->position += 1;
-        ite->idx = ((char *)ite->idx) + (ite->Header->elementSize);
-        return;
+    if (ArrayCapacity(*array) < ArraySize(*array) + 1) {
+        if (__array_grow(array, element_size, ArraySize(*array) + 1) == 0)
+            return 0;
     }
-}
-
-void ArrayIterator_prev(ArrayIterator *ite)
-{
-    if (ite->position == 0) {
-        ite->position = -1;
-        ite->idx = 0;
-        ite->Header = 0;
-        return;
-    } else {
-        ite->position -= 1;
-        ite->idx = ((char *)ite->idx) - (ite->Header->elementSize);
-        return;
+    if (array_null)
+        __ARRAY_RAW(*array)[0] = 0;
+    if (ArraySize(*array) - pos > 0) {
+        memmove(((char *)(*array) + (element_size * (pos + 1))),
+                ((char *)(*array) + (element_size * pos)),
+                element_size * (ArraySize(*array) - pos));
     }
-}
-
-void Array_ForEach(ArrayIterator ite, void *Data, ArrayExec_t action)
-{
-    while (ite.idx <= ite.Header->EndPtr) {
-        action(ite, Data, ite.idx);
-        ArrayIterator_next(&ite);
-    }
-}
-
-int ArrayIterator_toEnd(ArrayIterator *ite)
-{
-    if (ite->Header == 0)
-        return 0;
-    ArrayIterator_next(ite);
-
-    if (ite->idx == ite->Header->EndPtr)
-        return 0;
+    memcpy(((char *)(*array)) + (element_size * pos), element, element_size);
+    __ARRAY_RAW(*array)[__ARRAY_SIZE] += 1;
     return 1;
 }
 
-int ArrayIterator_toBegin(ArrayIterator *ite)
+int __array_concat(void **dest, void **src, uint32_t element_size)
 {
-    if (ite->Header == 0)
+    if (__array_grow(dest, element_size,
+        ArraySize(*dest) + ArraySize(*src)) == 0)
         return 0;
-    ArrayIterator_prev(ite);
-
-    if (ite->idx == ite->Header->HeadPtr)
-        return 0;
+    memcpy((char *)(*dest) + element_size * ArraySize(*dest), *src,
+            element_size * ArraySize(*src));
+    __ARRAY_RAW(*dest)[__ARRAY_SIZE] += ArraySize(*src);
     return 1;
 }
 
-int ArrayIterator_less(ArrayIterator i1, ArrayIterator i2)
+int __array_erase_shift(void **array, uint32_t element_size, uint32_t pos)
 {
-    if (i1.Header != i2.Header)
-        return ARRAY_INVALID;
-    else if (i1.position <= i2.position)
-        return ARRAY_TRUE;
-    return ARRAY_FALSE;
-}
-
-int ArrayIterator_greater(ArrayIterator i1, ArrayIterator i2)
-{
-    if (i1.Header != i2.Header)
-        return ARRAY_INVALID;
-    else if (i1.position >= i2.position)
-        return ARRAY_TRUE;
-    return ARRAY_FALSE;
-}
-
-int ArrayIterator_equal(ArrayIterator i1, ArrayIterator i2)
-{
-    if (i1.Header != i2.Header)
-        return ARRAY_INVALID;
-    else if (i1.position == i2.position)
-        return ARRAY_TRUE;
-    return ARRAY_FALSE;
-}
-
-int ArrayIterator_diff(ArrayIterator i1, ArrayIterator i2)
-{
-    if (i1.Header != i2.Header)
-        return ARRAY_INVALID;
-    else if (i1.position != i2.position)
-        return ARRAY_TRUE;
-    return ARRAY_FALSE;
-}
-
-void *ArrayIterator_get(ArrayIterator ite)
-{
-    if (ite.Header == 0)
+    if (ArraySize(*array) == 0)
         return 0;
-    return ite.idx;
+    if (ArraySize(*array) > 1) {
+        memmove(((char *)(*array) + (element_size * pos)),
+                ((char *)(*array) + (element_size * (pos + 1))),
+                element_size * (ArraySize(*array) - pos - 1));
+    }
+    __ARRAY_RAW(*array)[__ARRAY_SIZE] -= 1;
+    return 1;
+}
+
+int __array_erase_swap(void **array, uint32_t element_size, uint32_t pos)
+{
+    if (ArraySize(*array) == 0)
+        return 0;
+    if (ArraySize(*array) > 1) {
+        memcpy(((char *)(*array) + (element_size * pos)),
+                ((char *)(*array) + (element_size * (ArraySize(*array) - 1))),
+                element_size);
+    }
+    __ARRAY_RAW(*array)[__ARRAY_SIZE] -= 1;
+    return 1;
 }
